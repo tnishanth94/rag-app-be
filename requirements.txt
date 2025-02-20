@@ -1,0 +1,9 @@
+fastapi  
+uvicorn  
+langchain  
+chromadb  
+together  
+docling  
+pydantic  
+PyMuPDF
+sentence_transformers
