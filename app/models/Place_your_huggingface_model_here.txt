@@ -1,0 +1,1 @@
+Place your hugging face models here if you want to use local model. Else you can directly use HuggingFace transformer in the code.
