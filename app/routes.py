@@ -1,5 +1,5 @@
 from fastapi import APIRouter, UploadFile, File
-from app.pdf_ingestion import extract_text_and_images
+from app.pdf_ingestion import ingest_pdfs
 from app.query_handler import answer_question
 
 router = APIRouter()
@@ -11,7 +11,7 @@ async def ingest(file: UploadFile = File(...)):
     with open(pdf_path, "wb") as buffer:
         buffer.write(await file.read())
 
-    response = extract_text_and_images(pdf_path)
+    response = ingest_pdfs(pdf_path)
     return response
 
 @router.post("/query")

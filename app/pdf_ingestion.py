@@ -1,180 +1,134 @@
-# import fitz  # PyMuPDF
-# from langchain.text_splitter import RecursiveCharacterTextSplitter
-# from langchain.vectorstores import Chroma
-# from langchain.embeddings import HuggingFaceEmbeddings
-# import os
-# from langchain.vectorstores.utils import filter_complex_metadata
-# from langchain.schema import Document
-
-# model_path = os.path.join(os.path.dirname(__file__), "models")
-# embedding_function = HuggingFaceEmbeddings(model_name=model_path)
-
-# def extract_text_and_images(pdf_path):
-#     """Extracts text and images from the given PDF file."""
-#     doc = fitz.open(pdf_path)
-#     texts = []
-#     documents = []
-#     image_data = {}
-
-#     for page_num, page in enumerate(doc):
-#         page_text = page.get_text()
-#         texts.append(page_text)
-
-#         image_list = page.get_images(full=True)
-#         image_refs = []
-
-#         for img in image_list:
-#             xref = img[0]
-#             base_image = doc.extract_image(xref)
-#             image_bytes = base_image["image"]
-#             image_ext = base_image["ext"]
-            
-#             image_filename = f"static/images/page_{page_num+1}_{xref}.{image_ext}"
-#             with open(image_filename, "wb") as img_file:
-#                 img_file.write(image_bytes)
-            
-#             image_refs.append(image_filename)
-
-#         documents.append({
-#             "text": page_text,
-#             "metadata": {"images": image_refs, "page": page_num+1}
-#         })
-
-#     return documents
-
-# def clean_metadata(metadata):
-#     """ Convert list values to comma-separated strings. """
-#     if not isinstance(metadata, dict):
-#         return {}
-
-#     cleaned_metadata = {}
-#     for key, value in metadata.items():
-#         if isinstance(value, list):
-#             cleaned_metadata[key] = ", ".join(map(str, value))
-#         elif isinstance(value, (str, int, float, bool)):
-#             cleaned_metadata[key] = value
-#         else:
-#             cleaned_metadata[key] = str(value)
-
-#     return cleaned_metadata
-
-# def ingest_to_chroma(extracted_docs):
-#     docs_to_store = []
-
-#     for doc in extracted_docs:
-#         if not isinstance(doc, dict):
-#             print(f"Skipping unexpected type: {type(doc)}")
-#             continue
-
-#         metadata = doc.get("metadata", {})
-#         cleaned_metadata = clean_metadata(metadata)
-
-#         temp_doc = Document(page_content=doc["text"], metadata=cleaned_metadata)
-#         docs_to_store.append(temp_doc)
-
-#     vector_store = Chroma.from_documents(
-#         docs_to_store,
-#         HuggingFaceEmbeddings(model_name=model_path),
-#         persist_directory="./chroma_db"
-#     )
-
-#     return vector_store
-
-# if __name__ == "__main__":
-#     pdf_path = "uploads/developer_guide.pdf"
-
-#     extracted_docs = extract_text_and_images(pdf_path)
-
-#     vector_db = ingest_to_chroma(extracted_docs)
-
-#     sample_docs = vector_db.similarity_search("Sonarqube", k=5)
-#     for doc in sample_docs:
-#         print(doc.page_content, doc.metadata)
-
-import fitz  # PyMuPDF
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Chroma
-from langchain.embeddings import HuggingFaceEmbeddings
 import os
-from langchain.schema import Document
+import json
+import pickle
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import Chroma
+from pdf2image import convert_from_path
+from rank_bm25 import BM25Okapi
 
-model_path = os.path.join(os.path.dirname(__file__), "models")
-embedding_function = HuggingFaceEmbeddings(model_name=model_path)
+BASE_DIR = os.path.dirname(__file__)
+DATA_FOLDER = os.path.join(BASE_DIR, "data")
+DB_FOLDER = os.path.join(BASE_DIR, "vdb")
+IMAGE_FOLDER = os.path.join(BASE_DIR, "static/images")
+BM25_CORPUS_PATH = os.path.join(DATA_FOLDER, "bm25_corpus.json")
+BM25_INDEX_PATH = os.path.join(DATA_FOLDER, "bm25_index.pkl")
 
-def extract_text_and_images(pdf_path):
-    """Extracts text and images from the given PDF file."""
-    doc = fitz.open(pdf_path)
+os.makedirs(IMAGE_FOLDER, exist_ok=True)
+os.makedirs(DATA_FOLDER, exist_ok=True)
+os.makedirs(DB_FOLDER, exist_ok=True)
+
+model_path = os.path.join(BASE_DIR, "models")
+embedding_model = HuggingFaceEmbeddings(model_name=model_path)
+
+def preprocess_text(text):
+    """Tokenize text for BM25."""
+    return text.lower().split()
+
+def load_bm25_corpus():
+    """Load BM25 corpus from JSON."""
+    if os.path.exists(BM25_CORPUS_PATH) and os.path.getsize(BM25_CORPUS_PATH) > 0:
+        with open(BM25_CORPUS_PATH, "r", encoding="utf-8") as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                print("BM25 corpus is corrupted. Resetting.")
+                return []
+    return []
+
+def save_bm25_corpus(corpus):
+    """Save BM25 corpus to JSON."""
+    with open(BM25_CORPUS_PATH, "w", encoding="utf-8") as f:
+        json.dump(corpus, f, indent=4, ensure_ascii=False)
+
+def index_bm25(corpus):
+    """Creates a BM25 search Index and save."""
+    tokenized_corpus = [preprocess_text(doc["text"]) for doc in corpus]
+    bm25 = BM25Okapi(tokenized_corpus)
+    with open(BM25_INDEX_PATH, "wb") as f:
+        pickle.dump(bm25, f)
+    print(f"Indexed {len(corpus)} documents in BM25.")
+
+def extract_images_from_pdf(pdf_path, pdf_name):
+    """Converts PDF pages to images."""
+    image_paths = []
+    try:
+        images = convert_from_path(pdf_path, dpi=300)
+        for idx, img in enumerate(images):
+            image_filename = f"{pdf_name}_page_{idx+1}.png"
+            image_path = os.path.join(IMAGE_FOLDER, image_filename)
+            img.save(image_path, "PNG")
+            image_paths.append(image_path.replace("\\", "/"))
+    except Exception as e:
+        print(f"Error processing PDF images: {e}")
+    return image_paths
+
+def ingest_pdfs():
+    """Extracts text, stores in vector DB, and indexes BM25."""
     documents = []
+    bm25_corpus = load_bm25_corpus()
 
-    for page_num, page in enumerate(doc):
-        page_text = page.get_text()
-        image_list = page.get_images(full=True)
-        image_refs = []
+    for file_name in os.listdir(DATA_FOLDER):
+        if file_name.endswith(".pdf"):
+            pdf_path = os.path.join(DATA_FOLDER, file_name)
+            print(f"Processing: {pdf_path}")
+            images = extract_images_from_pdf(pdf_path, file_name)
+            loader = PyPDFLoader(pdf_path)
+            pages = loader.load()
+            for idx, page in enumerate(pages):
+                page.metadata["source"] = file_name
+                page.metadata["page"] = idx + 1
+                if idx < len(images):
+                    page.metadata["image_path"] = images[idx]
+            documents.extend(pages)
 
-        for img in image_list:
-            xref = img[0]
-            base_image = doc.extract_image(xref)
-            image_bytes = base_image["image"]
-            image_ext = base_image["ext"]
-            
-            image_filename = f"static/images/page_{page_num+1}_{xref}.{image_ext}"
-            with open(image_filename, "wb") as img_file:
-                img_file.write(image_bytes)
-            
-            image_refs.append(image_filename)
+    if not documents:
+        print("No documents found for ingestion.")
+        return
 
-        documents.append({
-            "text": page_text,
-            "metadata": {"images": image_refs if image_refs else "None", "page": page_num+1}
-        })
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=100)
+    chunks = text_splitter.split_documents(documents)
+    new_entries = [
+        {
+            "text": chunk.page_content,
+            "source": chunk.metadata["source"],
+            "page": chunk.metadata["page"],
+            "image_path": chunk.metadata.get("image_path", "")
+        }
+        for chunk in chunks
+    ]
+    bm25_corpus.extend(new_entries)
+    save_bm25_corpus(bm25_corpus)
+    index_bm25(bm25_corpus)
+    
+    vector_db = Chroma.from_documents(chunks, embedding_model, persist_directory=DB_FOLDER)
+    vector_db.persist()
+    print(f"Indexed {len(chunks)} chunks from {len(os.listdir(DATA_FOLDER))} PDFs.")
 
-    return documents
-
-def clean_metadata(metadata):
-    """Convert list values to comma-separated strings or 'None'."""
-    if not isinstance(metadata, dict):
-        return {}
-
-    cleaned_metadata = {}
-    for key, value in metadata.items():
-        if isinstance(value, list):
-            cleaned_metadata[key] = ", ".join(map(str, value)) if value else "None"
-        elif isinstance(value, (str, int, float, bool)):
-            cleaned_metadata[key] = value
-        else:
-            cleaned_metadata[key] = str(value)
-
-    return cleaned_metadata
-
-def ingest_to_chroma(extracted_docs):
-    docs_to_store = []
-
-    for doc in extracted_docs:
-        if not isinstance(doc, dict):
-            print(f"Skipping unexpected type: {type(doc)}")
-            continue
-
-        metadata = doc.get("metadata", {})
-        cleaned_metadata = clean_metadata(metadata)
-
-        temp_doc = Document(page_content=doc["text"], metadata=cleaned_metadata)
-        docs_to_store.append(temp_doc)
-
-    vector_store = Chroma.from_documents(
-        docs_to_store,
-        HuggingFaceEmbeddings(model_name=model_path),
-        persist_directory="./chroma_db"
-    )
-
-    return vector_store
+def search_bm25(query, top_n=5):
+    """Searches BM25 corpus for top relevant results."""
+    if not os.path.exists(BM25_INDEX_PATH):
+        print("BM25 index not found. Run ingestion first.")
+        return []
+    
+    with open(BM25_INDEX_PATH, "rb") as f:
+        bm25 = pickle.load(f)
+    
+    tokenized_query = preprocess_text(query)
+    scores = bm25.get_scores(tokenized_query)
+    top_indexes = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n]
+    
+    with open(BM25_CORPUS_PATH, "r", encoding="utf-8") as f:
+        corpus = json.load(f)
+    
+    results = [corpus[i] for i in top_indexes]
+    return results
 
 if __name__ == "__main__":
-    pdf_path = "uploads/developer_guide.pdf"
-
-    extracted_docs = extract_text_and_images(pdf_path)
-
-    vector_db = ingest_to_chroma(extracted_docs)
-
-    sample_docs = vector_db.similarity_search("Sonarqube", k=5)
-    for doc in sample_docs:
-        print(doc.page_content, doc.metadata)
+    ingest_pdfs()
+    test_query = "How to onboard users to Symphony?"
+    print(f"BM25 Search Results for '{test_query}':")
+    results = search_bm25(test_query)
+    for idx, result in enumerate(results):
+        print(f"{idx+1}. {result['text'][:200]}...")
